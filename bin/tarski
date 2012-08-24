@@ -1,0 +1,90 @@
+#!/usr/bin/env ruby
+
+require 'main'
+require 'json'
+require 'mixlib/config'
+require 'redis'
+require 'em-synchrony'
+require 'em-synchrony/amqp'
+
+class Tarski::Config
+  extend Mixlib::Config
+
+end
+
+Main {
+
+  option('config', 'c'){
+    description 'Load settings from a config file.'
+    argument :optional
+  }
+
+  def after_parse_parameters
+    if params[:config].given?
+      Tarski::Config.from_file(params[:config].value)
+    end
+  end
+
+  mode 'server' do
+   
+    def run
+      Signal.trap('TERM', &method(:stop))
+      EM.synchrony do
+        connect_redis
+        connect_amqp
+      end             
+    end
+
+    def stop
+      if EM.reactor_running?
+        EM::Synchrony.next_tick do
+          @amqp.close
+          EM.stop
+        end
+      end
+    end
+
+    def connect_redis
+      @redis = Redis.new(Tarski::Config[:redis])
+    end
+
+    def connect_amqp
+      @amqp = AMQP.connect("amqp://#{ Tarski::Config[:broker] }")
+      @channel = AMQP::Channel.new(@amqp)
+
+      @queue = @channel.queue('', {
+        autodelete: true,
+        exclusive: true,
+        arguments: { 'x-message-ttl' => 30000 }
+      })
+
+      @queue.bind(Tarski::Config[:exchange], routing_key: Tarski::Config[:routing_key])
+      @queue.subscribe(&method(:process_message))
+    end
+
+    def process_message(headers, payload)
+      message = JSON.parse(payload)
+
+      @rd.incr message["fields"]["sd_l_rc"]
+    end
+
+  end
+
+  mode 'ganglia' do
+
+    def run
+      @redis = Redis.new(Tarski::Config[:redis])
+
+      %w{ 200 400 404 }.each do |rc|
+        gmetric(rc, @redis[rc])
+      end
+
+    end
+
+    def gmetric(name, value)
+      %x{/usr/bin/gmetric -c #{Tarski::Config[:gmond_conf]} -g 'Response Codes' --name='#{name}' --value='#{value}' --type='int' --units='# of requests'}
+    end
+
+  end
+
+}

@@ -7,9 +7,19 @@ require 'redis'
 require 'em-synchrony'
 require 'em-synchrony/amqp'
 
-class Tarski::Config
-  extend Mixlib::Config
+require 'pry'
 
+module Tarski
+  class Config
+    extend Mixlib::Config
+
+    redis Hash.new
+
+    broker 'localhost'
+    exchange ''
+    routing_key '#'
+
+  end
 end
 
 Main {
@@ -28,7 +38,9 @@ Main {
   mode 'server' do
    
     def run
-      Signal.trap('TERM', &method(:stop))
+      Signal.trap('TERM') { stop }
+      Signal.trap('INT') { stop }
+
       EM.synchrony do
         connect_redis
         connect_amqp
@@ -64,8 +76,7 @@ Main {
 
     def process_message(headers, payload)
       message = JSON.parse(payload)
-
-      @rd.incr message["fields"]["sd_l_rc"]
+      @redis.incr message["@fields"]["sd_l_rc"]
     end
 
   end
@@ -75,14 +86,29 @@ Main {
     def run
       @redis = Redis.new(Tarski::Config[:redis])
 
-      %w{ 200 400 404 }.each do |rc|
-        gmetric(rc, @redis[rc])
+      keys = @redis.keys
+      codes = keys
+
+      %w{ 200 201 204 301 302 304 400 401 403 404 405 500 }.each do |rc|
+        if codes.include? rc
+          gmetric(rc, @redis[rc])
+          codes.delete(rc) 
+        end
+      end
+
+      (1..5).map(&:to_s).each do |prefix|
+        count = codes.delete_if { |rc| rc =~ /^#{prefix}..$/ } .map { |rc| @redis[rc].to_i } .reduce(:+)
+        gmetric("Other #{prefix}xx", count)
+      end
+
+      keys.each do |key|
+        @redis.del(key) unless codes.include? key
       end
 
     end
 
-    def gmetric(name, value)
-      %x{/usr/bin/gmetric -c #{Tarski::Config[:gmond_conf]} -g 'Response Codes' --name='#{name}' --value='#{value}' --type='int' --units='# of requests'}
+    def gmetric(name, value) 
+      %x{/usr/bin/gmetric -c #{Tarski::Config[:gmond_conf]} -g 'Response Codes' --name='#{name}' --value='#{value}' --type='int' --units='requests per minute'}
     end
 
   end

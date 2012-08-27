@@ -7,8 +7,6 @@ require 'redis'
 require 'em-synchrony'
 require 'em-synchrony/amqp'
 
-require 'pry'
-
 module Tarski
   class Config
     extend Mixlib::Config
@@ -19,6 +17,7 @@ module Tarski
     exchange ''
     routing_key '#'
 
+    label 'Response Codes'
   end
 end
 
@@ -76,7 +75,10 @@ Main {
 
     def process_message(headers, payload)
       message = JSON.parse(payload)
-      @redis.incr message["@fields"]["sd_l_rc"]
+      app = message['@fields']['appname']
+
+      @redis.sadd Tarski::Config[:label], app
+      @redis.hincrby "#{Tarski::Config[:label]}.#{app}", message["@fields"]["sd_l_rc"], 1
     end
 
   end
@@ -86,29 +88,31 @@ Main {
     def run
       @redis = Redis.new(Tarski::Config[:redis])
 
-      keys = @redis.keys
-      codes = keys
+      apps = @redis.smembers(Tarski::Config[:label])
 
-      %w{ 200 201 204 301 302 304 400 401 403 404 405 500 }.each do |rc|
-        if codes.include? rc
-          gmetric(rc, @redis[rc])
+      apps.each do |app| 
+        hash = "#{Tarski::Config[:label]}.#{app}"
+
+        codes = @redis.hgetall(hash)
+        @redis.del(hash)
+
+        %w{ 200 201 204 301 302 304 400 401 403 404 405 500 }.each do |rc|
+          gmetric(rc, codes[rc].to_i, app)
           codes.delete(rc) 
         end
-      end
 
-      (1..5).map(&:to_s).each do |prefix|
-        count = codes.delete_if { |rc| rc =~ /^#{prefix}..$/ } .map { |rc| @redis[rc].to_i } .reduce(:+)
-        gmetric("Other #{prefix}xx", count)
-      end
-
-      keys.each do |key|
-        @redis.del(key) unless codes.include? key
+        (1..5).map(&:to_s).each do |prefix|
+          count = codes.select { |rc, val| rc =~ /^#{prefix}..$/ } .map { |rc, val| val.to_i } .reduce(:+)
+          gmetric("Other #{prefix}xx", count, app) if count
+        end
       end
 
     end
 
-    def gmetric(name, value) 
-      %x{/usr/bin/gmetric -c #{Tarski::Config[:gmond_conf]} -g 'Response Codes' --name='#{name}' --value='#{value}' --type='int' --units='requests per minute'}
+    def gmetric(name, value, app) 
+      command = 
+        "/usr/bin/gmetric -c #{Tarski::Config[:gmond_conf]} -g 'Response Codes' --name='#{name}' --value='#{value}' --type='int32' --units='requests per minute' --spoof='#{app}:#{app}'"
+        %x{ #{command} }
     end
 
   end
